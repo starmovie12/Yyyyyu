@@ -50,7 +50,7 @@ async function recoverStuckTasks(): Promise<number> {
       const snap = await db.collection(col).where('status', '==', 'processing').get();
       for (const doc of snap.docs) {
         const data     = doc.data();
-        const lockedAt = data.lockedAt || data.updatedAt || data.createdAt;
+        const lockedAt = data.lockedAt || data.updatedAt || data.createdAt || data.addedAt;
         const lockedMs = lockedAt ? now - new Date(lockedAt).getTime() : Infinity;
 
         if (lockedMs > STUCK_TASK_THRESHOLD_MS) {
@@ -121,25 +121,8 @@ async function recoverStuckTasks(): Promise<number> {
   return recovered;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 7: STRICT SEQUENTIAL — Finish ALL links before starting next movie
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// RULE: Jab tak ek movie ki SAARI links complete na ho,
-//       dusri movie START NAHI HOGI.
-//
-// FLOW:
-//   Cron run → getActiveTask() check karo:
-//     Active task hai? → Uske pending links process karo (continue)
-//     Nahi hai?        → Naya queue item pick karo (new movie start)
-//
-//   Queue item "completed" TAB mark hoga jab scraping_task ke
-//   SAARE links done/error ho jayein — NOT before.
-// ═══════════════════════════════════════════════════════════════════════════════
-
 const TERMINAL = ['done', 'success', 'error', 'failed'];
 
-// Check if any scraping_task is still processing with pending links
 async function getActiveTask(): Promise<{ taskId: string; links: any[] } | null> {
   try {
     const snap = await db.collection('scraping_tasks')
@@ -159,7 +142,6 @@ async function getActiveTask(): Promise<{ taskId: string; links: any[] } | null>
     );
 
     if (pendingLinks.length === 0) {
-      // All links terminal — finalize task
       const allSuccess = links.every(
         (l: any) => ['done', 'success'].includes((l.status || '').toLowerCase())
       );
@@ -168,7 +150,6 @@ async function getActiveTask(): Promise<{ taskId: string; links: any[] } | null>
         completedAt: new Date().toISOString(),
       });
 
-      // Also mark queue item as completed
       for (const col of queueCollections) {
         const qSnap = await db.collection(col)
           .where('taskId', '==', doc.id)
@@ -183,10 +164,9 @@ async function getActiveTask(): Promise<{ taskId: string; links: any[] } | null>
         }
       }
 
-      return null; // No active task — can pick new movie
+      return null;
     }
 
-    // Active task with pending links found
     return { taskId: doc.id, links };
   } catch (e: any) {
     console.error('[Cron] getActiveTask error:', e.message);
@@ -194,7 +174,6 @@ async function getActiveTask(): Promise<{ taskId: string; links: any[] } | null>
   }
 }
 
-// Process pending links of a task (shared logic for both continue & new)
 async function processPendingLinks(
   taskId: string,
   links: any[],
@@ -209,12 +188,10 @@ async function processPendingLinks(
 
   console.log(`[Cron] Task ${taskId}: ${directLinks.length} direct + ${timerLinks.length} timer pending`);
 
-  // Direct links → CONCURRENT
   const directPromises = directLinks.map((l: any) =>
     processLink(l, l.id, taskId, 'Server/Auto-Pilot')
   );
 
-  // Timer links → STRICTLY SEQUENTIAL (one per execution, relay rest)
   let triggeredRelay = false;
   const timerPromise = (async () => {
     if (timerLinks.length > 0) {
@@ -250,7 +227,6 @@ async function processPendingLinks(
 
   await Promise.allSettled([...directPromises, timerPromise]);
 
-  // Re-read fresh data from DB
   const freshSnap  = await db.collection('scraping_tasks').doc(taskId).get();
   const freshLinks: any[] = freshSnap.data()?.links || [];
   const stillPending = freshLinks.filter(
@@ -260,7 +236,6 @@ async function processPendingLinks(
     (l: any) => ['done', 'success'].includes((l.status || '').toLowerCase())
   ).length;
 
-  // If ALL done and no relay pending, finalize everything
   if (stillPending === 0 && !triggeredRelay) {
     const allSuccess = freshLinks.every(
       (l: any) => ['done', 'success'].includes((l.status || '').toLowerCase())
@@ -270,7 +245,6 @@ async function processPendingLinks(
       completedAt: new Date().toISOString(),
     });
 
-    // Mark queue item as completed
     for (const col of queueCollections) {
       const qSnap = await db.collection(col)
         .where('taskId', '==', taskId)
@@ -285,20 +259,16 @@ async function processPendingLinks(
       }
     }
   }
-  // If still pending: task stays "processing" — next cron continues it
 
   return { triggeredRelay, stillPending, doneLinks, totalLinks: freshLinks.length };
 }
 
-// ─── GET /api/cron/process-queue ─────────────────────────────────────────────
 export async function GET(req: NextRequest) {
-  
-  // 🔴 FIX: Hardcoded Password Check (Ab Vercel me setting ki zarurat nahi)
   const expectedSecret = process.env.CRON_SECRET || 'MflixProSecret123';
   const authHeader = req.headers.get('Authorization') || '';
 
   if (authHeader !== `Bearer ${expectedSecret}`) {
-    return NextResponse.json({ error: 'Unauthorized (Galat Password)' }, { status: 401 });
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   const overallStart = Date.now();
@@ -306,58 +276,45 @@ export async function GET(req: NextRequest) {
   try {
     await updateHeartbeat('running', 'Cron started');
 
-    // Step 1: Recover stuck tasks
     const recovered = await recoverStuckTasks();
     if (recovered > 0) {
       await sendTelegram(`🔧 Auto-Recovery\n♻️ ${recovered} stuck task(s) recovered`);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Step 2: CHECK ACTIVE TASK — Continue existing movie if links pending
-    // ═══════════════════════════════════════════════════════════════════════
     const activeTask = await getActiveTask();
 
     if (activeTask) {
-      console.log(`[Cron] Active task ${activeTask.taskId} — continuing (not starting new movie)`);
-
       const result = await processPendingLinks(activeTask.taskId, activeTask.links, req);
-
       try { await cleanupExpiredCache(); } catch { /* */ }
-
       const elapsed = Math.round((Date.now() - overallStart) / 1000);
 
       if (result.stillPending === 0 && !result.triggeredRelay) {
-        await sendTelegram(
-          `✅ Movie Complete 🎬\n🔗 ${result.doneLinks}/${result.totalLinks} done\n⏱ ${elapsed}s`
-        );
+        await sendTelegram(`✅ Movie Complete 🎬\n🔗 ${result.doneLinks}/${result.totalLinks} done\n⏱ ${elapsed}s`);
         await updateHeartbeat('idle', 'Movie complete — ready for next');
       } else {
         await updateHeartbeat('idle', `Continuing — ${result.stillPending}/${result.totalLinks} pending`);
       }
 
       return NextResponse.json({
-        status:        'continued',
-        taskId:        activeTask.taskId,
-        stillPending:  result.stillPending,
-        doneLinks:     result.doneLinks,
-        totalLinks:    result.totalLinks,
-        triggeredRelay: result.triggeredRelay,
+        status: 'continued',
+        taskId: activeTask.taskId,
+        stillPending: result.stillPending,
+        doneLinks: result.doneLinks,
+        totalLinks: result.totalLinks,
         recovered,
         elapsed,
       });
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Step 3: No active task — Pick NEW queue item (start new movie)
-    // ═══════════════════════════════════════════════════════════════════════
     let item: any = null;
     let queueCollection = '';
 
     for (const col of queueCollections) {
+      // 🔴 FIX: orderBy('addedAt') use kiya kyunki aapka data addedAt use karta hai
       const snap = await db
         .collection(col)
         .where('status', '==', 'pending')
-        .orderBy('createdAt', 'asc')
+        .orderBy('addedAt', 'asc') 
         .limit(1)
         .get();
 
@@ -374,14 +331,12 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ status: 'idle', message: 'Queue empty', recovered });
     }
 
-    // Lock queue item
     await db.collection(queueCollection).doc(item.id).update({
       status:     'processing',
       lockedAt:   new Date().toISOString(),
       retryCount: item.retryCount || 0,
     });
 
-    // Extract links
     let listResult: any;
     try {
       listResult = await extractMovieLinks(item.url);
@@ -391,12 +346,11 @@ export async function GET(req: NextRequest) {
     } catch (extractionError: any) {
       const currentRetries = item.retryCount || 0;
       const isFinalFail = currentRetries >= MAX_CRON_RETRIES;
-
       await db.collection(queueCollection).doc(item.id).update({
-        status:     isFinalFail ? 'failed' : 'pending',
-        error:      `Extraction failed: ${extractionError.message}`,
-        failedAt:   isFinalFail ? new Date().toISOString() : null,
-        lockedAt:   null,
+        status: isFinalFail ? 'failed' : 'pending',
+        error: `Extraction failed: ${extractionError.message}`,
+        failedAt: isFinalFail ? new Date().toISOString() : null,
+        lockedAt: null,
         retryCount: currentRetries + 1,
       });
       throw extractionError;
@@ -409,7 +363,6 @@ export async function GET(req: NextRequest) {
       logs:   [],
     }));
 
-    // Create scraping task
     const taskRef = await db.collection('scraping_tasks').add({
       url:         item.url,
       status:      'processing',
@@ -421,38 +374,25 @@ export async function GET(req: NextRequest) {
     });
     const taskId = taskRef.id;
 
-    // Link taskId to queue item
     await db.collection(queueCollection).doc(item.id).update({ taskId });
 
-    // Process links
     const result = await processPendingLinks(taskId, linksWithIds, req);
-
     try { await cleanupExpiredCache(); } catch { /* */ }
-
     const elapsed = Math.round((Date.now() - overallStart) / 1000);
     const title   = listResult.metadata?.title || item.url;
-    const retry   = item.retryCount || 0;
 
     if (result.stillPending === 0 && !result.triggeredRelay) {
       await updateHeartbeat('idle', 'Complete');
-      await sendTelegram(
-        `✅ Auto-Pilot Complete 🤖\n🎬 ${title}\n⏱ ${elapsed}s\n🔗 ${result.doneLinks}/${result.totalLinks} done\n🔄 Retry: ${retry}/${MAX_CRON_RETRIES}`
-      );
+      await sendTelegram(`✅ Auto-Pilot Complete 🤖\n🎬 ${title}\n⏱ ${elapsed}s`);
     } else {
-      await updateHeartbeat('idle', `Processing ${title} — ${result.stillPending} pending`);
-      await sendTelegram(
-        `⏳ Auto-Pilot Processing 🤖\n🎬 ${title}\n⏱ ${elapsed}s\n🔗 ${result.doneLinks}/${result.totalLinks} done — ${result.stillPending} pending\n${result.triggeredRelay ? '🔄 Relay active' : '⏳ Next cron continues'}`
-      );
+      await updateHeartbeat('idle', `Processing ${title}`);
     }
 
     return NextResponse.json({
-      status:        result.stillPending > 0 ? 'in-progress' : 'ok',
+      status: result.stillPending > 0 ? 'in-progress' : 'ok',
       taskId,
       recovered,
-      triggeredRelay: result.triggeredRelay,
-      stillPending:  result.stillPending,
-      totalLinks:    result.totalLinks,
-      doneLinks:     result.doneLinks,
+      stillPending: result.stillPending,
       elapsed,
     });
   } catch (err: any) {
