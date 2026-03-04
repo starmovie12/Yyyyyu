@@ -12,7 +12,11 @@ import {
   HTTP_522_MAX_RETRIES,
   LINK_TIMEOUT_MS,
 } from './config';
-import { getVpsConfig } from './vpsConfig';
+// ─── HARDCODED VPS API URLS ────────────────────────────────────────────────
+// HubCloud API:  http://85.121.5.246:5001/solve?url=...
+// Timer API:     http://85.121.5.246:10000/solve?url=...
+const HUBCLOUD_API_URL = 'http://85.121.5.246:5001';
+const TIMER_API_URL    = 'http://85.121.5.246:10000';
 import type {
   ExtractMovieLinksResult,
   HubCloudNativeResult,
@@ -805,8 +809,7 @@ export async function solveHubDrive(url: string): Promise<HubDriveResult> {
 export async function solveHubCloudNative(url: string): Promise<HubCloudNativeResult> {
   console.log(`[HubCloud] Starting VPS solver: ${url}`);
   try {
-    const { hubcloudApi } = await getVpsConfig();
-    const resp = await axios.get(`${hubcloudApi}/solve?url=${encodeURIComponent(url)}`, {
+    const resp = await axios.get(`${HUBCLOUD_API_URL}/solve?url=${encodeURIComponent(url)}`, {
       timeout: AXIOS_TIMEOUT_MS, // 45s — was 20s (caused premature kills)
       headers: { 'User-Agent': 'MflixPro/1.0' },
     });
@@ -838,8 +841,7 @@ export async function solveHubCloudNative(url: string): Promise<HubCloudNativeRe
 export async function solveGadgetsWebNative(url: string): Promise<GadgetsWebResult> {
   console.log(`[GadgetsWeb] Starting VPS Timer solver: ${url}`);
   try {
-    const { timerApi } = await getVpsConfig();
-    const resp = await axios.get(`${timerApi}/solve?url=${encodeURIComponent(url)}`, {
+    const resp = await axios.get(`${TIMER_API_URL}/solve?url=${encodeURIComponent(url)}`, {
       timeout: AXIOS_TIMEOUT_MS, // 45s — was 20s (ROOT CAUSE of "Timeout 20s" error)
       headers: { 'User-Agent': 'MflixPro/1.0' },
     });
