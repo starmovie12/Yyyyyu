@@ -57,22 +57,20 @@ async function solveHubCloudSequential(url: string): Promise<ReturnType<typeof s
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── HELPER: fetchJSON ────────────────────────────────────────────────────────
-// VPS API call with timeout from config (50s), NOT hardcoded 20s
+// Uses axios (same as solvers) — much faster than fetch() for VPS calls
 async function fetchJSON(url: string, timeoutMs = LINK_TIMEOUT_MS): Promise<any> {
-  const ctrl  = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const axios = (await import('axios')).default;
   try {
-    const res = await fetch(url, {
-      signal:  ctrl.signal,
+    const res = await axios.get(url, {
+      timeout: timeoutMs,
       headers: { 'User-Agent': 'MflixPro/3.0' },
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+    return res.data;
   } catch (err: any) {
-    if (err.name === 'AbortError') throw new Error(`Timed out after ${timeoutMs / 1000}s`);
+    if (err.code === 'ECONNABORTED' || err.message?.includes('timeout')) {
+      throw new Error(`Timed out after ${timeoutMs / 1000}s`);
+    }
     throw err;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
