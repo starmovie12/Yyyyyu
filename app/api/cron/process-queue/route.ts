@@ -174,7 +174,7 @@ async function getActiveTask(): Promise<{ taskId: string; links: any[] } | null>
   }
 }
 
-// 🔴 THE FIX: SERVER RAM LIMIT & TIMEOUT BYPASS
+// 🔴 THE FIX: STRICT SEQUENTIAL (Ek baar mein sirf 1 link ka wait karenge)
 async function processPendingLinks(
   taskId: string,
   links: any[],
@@ -185,56 +185,60 @@ async function processPendingLinks(
     (l: any) => !TERMINAL.includes((l.status || '').toLowerCase())
   );
 
-  console.log(`[Cron] Task ${taskId}: ${pendingLinks.length} total pending links. Picking ONLY 1 to save RAM.`);
+  console.log(`[Cron] Task ${taskId}: ${pendingLinks.length} total pending links. Picking ONLY 1 to process and wait.`);
 
   let triggeredRelay = false;
 
-  // RULE: Pick ONLY the FIRST pending link (No concurrent direct links, no server crash)
+  // RULE: Pick ONLY the FIRST pending link
   if (pendingLinks.length > 0) {
     const targetLink = pendingLinks[0];
-    const isTimerDomain = TIMER_DOMAINS.some(d => targetLink.link?.includes(d));
 
-    // 'Fire and Forget' pattern: Start processing but DO NOT 'await' it to stop Vercel Timeout
-    processLink(targetLink, targetLink.id, taskId, 'Server/Auto-Pilot').catch(e => {
+    try {
+        // 'Await' lagaya hai. Matlab Vercel yahan ruka rahega jab tak yeh ek quality puri nahi nikal jati.
+        console.log(`[Cron] Processing link ${targetLink.id} and waiting for completion...`);
+        await processLink(targetLink, targetLink.id, taskId, 'Server/Auto-Pilot');
+        console.log(`[Cron] Link ${targetLink.id} processed successfully.`);
+    } catch (e) {
         console.error(`[Process Error on link ${targetLink.id}]`, e);
-    });
-
-    // If there are more links remaining, trigger Relay for the next one immediately
-    if (pendingLinks.length > 1) {
-      triggeredRelay = true;
-      const targetUrl = process.env.VERCEL_URL
-        ? `https://${process.env.VERCEL_URL}/api/solve_task`
-        : `${req.nextUrl.origin}/api/solve_task`;
-
-      try {
-        // Calling Relay API but NOT awaiting it.
-        fetch(targetUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-mflix-internal': 'true',
-          },
-          body: JSON.stringify({
-            taskId,
-            // Pass ONLY the next link in the queue to Relay
-            timerLinks: [pendingLinks[1]], 
-            timerIndex: 0,
-            extractedBy: 'Server/Auto-Pilot',
-            relayDepth: 1,
-            mode: 'relay',
-          }),
-          keepalive: true,
-        }).catch(e => console.error('[Relay] error:', e));
-      } catch { /* non-critical */ }
     }
   }
 
-  // Note: We are no longer waiting for fresh data from DB here because we "Fired and Forgot".
-  // This ensures the Vercel function returns in < 1 second.
-  const stillPending = pendingLinks.length > 0 ? pendingLinks.length - 1 : 0;
-  const doneLinks = links.length - pendingLinks.length;
+  // Ab DB se fresh data lo, kyunki pehla link process ho chuka hai.
+  const freshSnap  = await db.collection('scraping_tasks').doc(taskId).get();
+  const freshLinks: any[] = freshSnap.data()?.links || [];
+  const stillPending = freshLinks.filter(
+    (l: any) => !TERMINAL.includes((l.status || '').toLowerCase())
+  ).length;
+  const doneLinks = freshLinks.filter(
+    (l: any) => ['done', 'success'].includes((l.status || '').toLowerCase())
+  ).length;
 
-  return { triggeredRelay, stillPending, doneLinks, totalLinks: links.length };
+  // Agar sare links khatam ho gaye, toh Task complete mark kardo.
+  if (stillPending === 0) {
+    const allSuccess = freshLinks.every(
+      (l: any) => ['done', 'success'].includes((l.status || '').toLowerCase())
+    );
+    await db.collection('scraping_tasks').doc(taskId).update({
+      status: allSuccess ? 'completed' : 'failed',
+      completedAt: new Date().toISOString(),
+    });
+
+    for (const col of queueCollections) {
+      const qSnap = await db.collection(col)
+        .where('taskId', '==', taskId)
+        .where('status', '==', 'processing')
+        .limit(1)
+        .get();
+      if (!qSnap.empty) {
+        await qSnap.docs[0].ref.update({
+          status: 'completed',
+          processedAt: new Date().toISOString(),
+        });
+      }
+    }
+  }
+
+  return { triggeredRelay, stillPending, doneLinks, totalLinks: freshLinks.length };
 }
 
 export async function GET(req: NextRequest) {
