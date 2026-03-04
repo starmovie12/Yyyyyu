@@ -292,12 +292,13 @@ async function processPendingLinks(
 
 // ─── GET /api/cron/process-queue ─────────────────────────────────────────────
 export async function GET(req: NextRequest) {
-  const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret) {
-    const authHeader = req.headers.get('Authorization') || '';
-    if (authHeader !== `Bearer ${cronSecret}`) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
+  
+  // 🔴 FIX: Hardcoded Password Check (Ab Vercel me setting ki zarurat nahi)
+  const expectedSecret = process.env.CRON_SECRET || 'MflixProSecret123';
+  const authHeader = req.headers.get('Authorization') || '';
+
+  if (authHeader !== `Bearer ${expectedSecret}`) {
+    return NextResponse.json({ error: 'Unauthorized (Galat Password)' }, { status: 401 });
   }
 
   const overallStart = Date.now();
