@@ -18,6 +18,26 @@ import { getCachedLink, setCachedLink } from '@/lib/cache';
 export const maxDuration = 60;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL VPS MUTEX — CRITICAL FIX
+// HubCloud VPS (port 5001) can only handle ONE request at a time.
+// Links resolve through different paths (hblinks→hubcloud, hubdrive→hubcloud, etc.)
+// and all end up calling solveHubCloudNative() concurrently — VPS gets overwhelmed.
+//
+// Solution: A promise-chain mutex. Every call to solveHubCloudNative() is
+// chained so they execute strictly one after another, no matter how many
+// parallel processLink() calls are running.
+// ═══════════════════════════════════════════════════════════════════════════════
+let _hubcloudMutex: Promise<void> = Promise.resolve();
+
+async function solveHubCloudSequential(url: string): Promise<ReturnType<typeof solveHubCloudNative>> {
+  // Chain onto the existing mutex — wait for previous call to finish first
+  const result = _hubcloudMutex.then(() => solveHubCloudNative(url));
+  // Extend the mutex to cover this call (swallow errors so mutex never breaks)
+  _hubcloudMutex = result.then(() => {}, () => {});
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // PHASE 6: STREAM SOLVE — Live NDJSON Streaming with Sequential Timer Links
 // ═══════════════════════════════════════════════════════════════════════════════
 //
@@ -271,8 +291,8 @@ export async function POST(req: Request) {
 
             // HubCloud / HubCDN
             if (currentLink.includes('hubcloud') || currentLink.includes('hubcdn')) {
-              log('☁️ HubCloud solving via VPS...');
-              const r = await solveHubCloudNative(currentLink);
+              log('☁️ HubCloud solving via VPS... (queued)');
+              const r = await solveHubCloudSequential(currentLink);
               if (r.status === 'success' && r.best_download_link) {
                 log(`✅ Done: ${r.best_download_link}`, 'success');
                 return {
@@ -283,6 +303,7 @@ export async function POST(req: Request) {
                   logs,
                 };
               }
+              log(`❌ HubCloud VPS failed: ${r.message}`, 'error');
               return { status: 'error', error: r.message, logs };
             }
 
