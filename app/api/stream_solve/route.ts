@@ -17,47 +17,21 @@ import { getCachedLink, setCachedLink } from '@/lib/cache';
 
 export const maxDuration = 60;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// GLOBAL VPS MUTEX — CRITICAL FIX
+// ═══════════════════════════════════════════════════════════════════════════
+// GLOBAL VPS MUTEX — ONE REQUEST AT A TIME
 // HubCloud VPS (port 5001) can only handle ONE request at a time.
-// Links resolve through different paths (hblinks→hubcloud, hubdrive→hubcloud, etc.)
-// and all end up calling solveHubCloudNative() concurrently — VPS gets overwhelmed.
-//
-// Solution: A promise-chain mutex. Every call to solveHubCloudNative() is
-// chained so they execute strictly one after another, no matter how many
-// parallel processLink() calls are running.
-// ═══════════════════════════════════════════════════════════════════════════════
+// This mutex ensures ALL paths that lead to solveHubCloudNative() are
+// queued strictly one after another.
+// ═══════════════════════════════════════════════════════════════════════════
 let _hubcloudMutex: Promise<void> = Promise.resolve();
 
 async function solveHubCloudSequential(url: string): Promise<ReturnType<typeof solveHubCloudNative>> {
-  // Chain onto the existing mutex — wait for previous call to finish first
   const result = _hubcloudMutex.then(() => solveHubCloudNative(url));
-  // Extend the mutex to cover this call (swallow errors so mutex never breaks)
   _hubcloudMutex = result.then(() => {}, () => {});
   return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 6: STREAM SOLVE — Live NDJSON Streaming with Sequential Timer Links
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// This endpoint streams real-time logs to the browser via NDJSON.
-// TIMER links: STRICTLY ONE BY ONE (sequential) — VPS can only handle 1 at a time.
-// DIRECT links: CONCURRENT via Promise.allSettled (they're fast).
-//
-// Supports:
-//   • Full task processing (all pending links)
-//   • Retry failed only (retryFailedOnly: true)
-//   • Single link retry (singleLinkId provided)
-//
-// NDJSON format:
-//   { "id": 0, "msg": "⏱ Timer solving...", "type": "info" }    ← log message
-//   { "id": 0, "status": "done", "final": "https://...", ... }  ← result
-//   { "id": 0, "status": "finished" }                           ← link complete
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// ─── HELPER: fetchJSON ────────────────────────────────────────────────────────
-// Uses axios (same as solvers) — much faster than fetch() for VPS calls
+// ─── HELPER: fetchJSON ────────────────────────────────────────────────────
 async function fetchJSON(url: string, timeoutMs = LINK_TIMEOUT_MS): Promise<any> {
   const axios = (await import('axios')).default;
   try {
@@ -74,8 +48,7 @@ async function fetchJSON(url: string, timeoutMs = LINK_TIMEOUT_MS): Promise<any>
   }
 }
 
-// ─── HELPER: saveToFirestore ──────────────────────────────────────────────────
-// Atomic transaction — saves ONLY final direct download link
+// ─── HELPER: saveToFirestore ──────────────────────────────────────────────
 async function saveToFirestore(
   taskId: string | undefined,
   lid: number | string,
@@ -91,7 +64,6 @@ async function saveToFirestore(
   extractedBy: string,
 ): Promise<void> {
   if (!taskId) return;
-
   try {
     const taskRef = db.collection('scraping_tasks').doc(taskId);
     await db.runTransaction(async (tx) => {
@@ -115,16 +87,28 @@ async function saveToFirestore(
         return l;
       });
 
+      // ── Task status logic ──────────────────────────────────────────────
+      // Task is "completed" ONLY if ALL links have finalLink (done/success).
+      // Even one failed link = task is "failed", not "completed".
       const allDone = updated.every((l: any) =>
         ['done', 'success', 'error', 'failed'].includes((l.status || '').toLowerCase())
       );
-      const anySuccess = updated.some((l: any) =>
+      const allSuccess = updated.every((l: any) =>
         ['done', 'success'].includes((l.status || '').toLowerCase())
       );
 
+      // Status rules:
+      // - All links done + all succeeded → completed
+      // - All links done + any failed → failed
+      // - Still processing → processing
+      let taskStatus = 'processing';
+      if (allDone) {
+        taskStatus = allSuccess ? 'completed' : 'failed';
+      }
+
       tx.update(taskRef, {
         links: updated,
-        status: allDone ? (anySuccess ? 'completed' : 'failed') : 'processing',
+        status: taskStatus,
         extractedBy,
         ...(allDone ? { completedAt: new Date().toISOString() } : {}),
       });
@@ -134,9 +118,9 @@ async function saveToFirestore(
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 // POST /api/stream_solve — MAIN HANDLER
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 export async function POST(req: Request) {
   let body: any;
   try { body = await req.json(); } catch {
@@ -146,24 +130,22 @@ export async function POST(req: Request) {
   const allLinks: any[]   = body?.links || [];
   const taskId: string     = body?.taskId;
   const extractedBy        = body?.extractedBy || 'Browser/Live';
-  const retryFailedOnly    = body?.retryFailedOnly === true;  // Problem 4: Retry Failed Only
-  const singleLinkId       = body?.singleLinkId;               // Problem 5: Individual Repeat
+  const retryFailedOnly    = body?.retryFailedOnly === true;
+  const singleLinkId       = body?.singleLinkId;
 
   if (!allLinks.length) {
     return new Response(JSON.stringify({ error: 'No links provided' }), { status: 400 });
   }
 
-  // ─── Filter links based on mode ───────────────────────────────────────
+  // ─── Filter links based on mode ─────────────────────────────────────
   let linksToProcess: any[];
 
   if (singleLinkId !== undefined && singleLinkId !== null) {
-    // PROBLEM 5: Single link retry — only process this specific link
     linksToProcess = allLinks.filter((l: any) => l.id === singleLinkId);
     if (linksToProcess.length === 0) {
       return new Response(JSON.stringify({ error: 'Link not found' }), { status: 404 });
     }
   } else if (retryFailedOnly) {
-    // PROBLEM 4: Retry Failed Only — skip already-done links
     linksToProcess = allLinks.filter((l: any) => {
       const s = (l.status || '').toLowerCase();
       return s !== 'done' && s !== 'success';
@@ -172,7 +154,6 @@ export async function POST(req: Request) {
       return new Response(JSON.stringify({ error: 'No failed/pending links to retry' }), { status: 200 });
     }
   } else {
-    // Normal: process all provided links
     linksToProcess = allLinks;
   }
 
@@ -180,56 +161,60 @@ export async function POST(req: Request) {
     async start(controller) {
       const encoder      = new TextEncoder();
       const overallStart = Date.now();
+      let   linksDone    = 0;
 
       const send = (data: any) => {
-        try {
-          controller.enqueue(encoder.encode(JSON.stringify(data) + '\n'));
-        } catch { /* stream closed */ }
+        try { controller.enqueue(encoder.encode(JSON.stringify(data) + '\n')); }
+        catch { /* stream closed */ }
       };
 
-      // ─── processLink (stream version) ─────────────────────────────────
-      const processLink = async (linkData: any, lid: number | string): Promise<void> => {
+      // ═══════════════════════════════════════════════════════════════════
+      // processOneLinkWithRetry — Core solver with 1 automatic retry
+      // Returns: { status, finalLink?, error?, logs[], best_button_name? }
+      // ═══════════════════════════════════════════════════════════════════
+      const processOneLinkWithRetry = async (
+        linkData: any,
+        lid: number | string,
+        attempt: number,
+      ): Promise<any> => {
         const originalUrl = linkData.link;
         let   currentLink = originalUrl;
         const logs: { msg: string; type: string }[] = [];
 
-        // Real-time log sender
         const log = (msg: string, type = 'info') => {
           logs.push({ msg, type });
           send({ id: lid, msg, type });
         };
 
-        // ─── CACHE CHECK ─────────────────────────────────────────────────
-        try {
-          const cached = await getCachedLink(originalUrl);
-          if (cached && cached.finalLink) {
-            log('⚡ CACHE HIT — resolved in 0ms', 'success');
-            // Save to Firestore
-            const taskRef = db.collection('scraping_tasks').doc(taskId);
-            await db.runTransaction(async (tx: any) => {
-              const snap = await tx.get(taskRef);
-              if (!snap.exists) return;
-              const dbLinks = snap.data()!.links || [];
-              const idx = dbLinks.findIndex((l: any) => String(l.id) === String(lid));
-              if (idx === -1) return;
-              dbLinks[idx] = {
-                ...dbLinks[idx],
-                status: 'done',
-                finalLink: cached.finalLink,
-                best_button_name: cached.best_button_name ?? null,
-                all_available_buttons: cached.all_available_buttons ?? [],
-                logs: [{ msg: '⚡ CACHE HIT', type: 'success' }],
-                solvedAt: new Date().toISOString(),
-              };
-              tx.update(taskRef, { links: dbLinks });
-            });
-            send({ id: lid, status: 'done', final: cached.finalLink, best_button_name: cached.best_button_name });
-            send({ id: lid, status: 'finished' });
-            return;
-          }
-        } catch { /* cache miss */ }
-
-        let resultPayload: any;
+        // ── Cache check (attempt 1 only) ───────────────────────────────
+        if (attempt === 1) {
+          try {
+            const cached = await getCachedLink(originalUrl);
+            if (cached && cached.finalLink) {
+              log('⚡ CACHE HIT — resolved in 0ms', 'success');
+              const taskRef = db.collection('scraping_tasks').doc(taskId);
+              await db.runTransaction(async (tx: any) => {
+                const snap = await tx.get(taskRef);
+                if (!snap.exists) return;
+                const dbLinks = snap.data()!.links || [];
+                const idx = dbLinks.findIndex((l: any) => String(l.id) === String(lid));
+                if (idx === -1) return;
+                dbLinks[idx] = {
+                  ...dbLinks[idx],
+                  status: 'done',
+                  finalLink: cached.finalLink,
+                  best_button_name: cached.best_button_name ?? null,
+                  all_available_buttons: cached.all_available_buttons ?? [],
+                  logs: [{ msg: '⚡ CACHE HIT', type: 'success' }],
+                  solvedAt: new Date().toISOString(),
+                };
+                tx.update(taskRef, { links: dbLinks });
+              });
+              send({ id: lid, status: 'done', final: cached.finalLink, best_button_name: cached.best_button_name });
+              return { status: 'done', finalLink: cached.finalLink, logs };
+            }
+          } catch { /* cache miss */ }
+        }
 
         try {
           const solving = async () => {
@@ -241,7 +226,7 @@ export async function POST(req: Request) {
               return { status: 'error', error: r.message, logs };
             }
 
-            // Timer bypass loop
+            // Timer bypass loop (gadgetsweb etc.)
             let loopCount = 0;
             while (loopCount < 3 && !(TARGET_DOMAINS.some(d => currentLink.includes(d)))) {
               if (!TIMER_DOMAINS.some(d => currentLink.includes(d)) && loopCount === 0) break;
@@ -253,7 +238,6 @@ export async function POST(req: Request) {
                 log(`❌ GadgetsWeb failed: ${r.message}`, 'error');
                 break;
               } else {
-                // VPS Timer bypass — timeout from config (50s)
                 log(`⏱ Timer bypass via VPS (loop ${loopCount + 1})`);
                 const r = await fetchJSON(
                   `${TIMER_API}/solve?url=${encodeURIComponent(currentLink)}`,
@@ -272,8 +256,7 @@ export async function POST(req: Request) {
               if (r.status === 'success' && r.link) {
                 currentLink = r.link;
                 log(`✅ HBLinks → ${r.source || 'resolved'}`);
-              }
-              else return { status: 'error', error: r.message, logs };
+              } else return { status: 'error', error: r.message, logs };
             }
 
             // HubDrive
@@ -283,11 +266,10 @@ export async function POST(req: Request) {
               if (r.status === 'success' && r.link) {
                 currentLink = r.link;
                 log('✅ HubDrive → resolved');
-              }
-              else return { status: 'error', error: r.message, logs };
+              } else return { status: 'error', error: r.message, logs };
             }
 
-            // HubCloud / HubCDN
+            // HubCloud / HubCDN — mutex ensures only 1 at a time
             if (currentLink.includes('hubcloud') || currentLink.includes('hubcdn')) {
               log(`☁️ HubCloud VPS call: ${currentLink}`);
               try {
@@ -318,7 +300,7 @@ export async function POST(req: Request) {
               return { finalLink: currentLink, status: 'done', logs };
             }
 
-            // Fallback — if current link changed from original, it might be resolved
+            // Fallback
             if (currentLink !== originalUrl) {
               log(`✅ Resolved: ${currentLink}`, 'success');
               return { finalLink: currentLink, status: 'done', logs };
@@ -327,102 +309,81 @@ export async function POST(req: Request) {
             return { status: 'error', error: 'No solver matched', logs };
           };
 
-          // Per-link timeout race (50s from config)
-          resultPayload = await Promise.race([
+          return await Promise.race([
             solving(),
             new Promise<any>((_, rej) =>
               setTimeout(() => rej(new Error(`Timeout ${LINK_TIMEOUT_MS / 1000}s`)), LINK_TIMEOUT_MS),
             ),
           ]);
+
         } catch (err: any) {
-          resultPayload = { status: 'error', error: err.message, logs };
+          return { status: 'error', error: err.message, logs };
+        }
+      };
+
+      // ═══════════════════════════════════════════════════════════════════
+      // processLink — Wraps processOneLinkWithRetry with 1 auto-retry
+      // If attempt 1 fails → wait 2s → try again → then give up
+      // ═══════════════════════════════════════════════════════════════════
+      const processLink = async (linkData: any, lid: number | string, linkNum: number, total: number): Promise<void> => {
+        send({ id: lid, msg: `🔄 Link ${linkNum}/${total} — starting...`, type: 'info' });
+
+        // Attempt 1
+        let result = await processOneLinkWithRetry(linkData, lid, 1);
+
+        // Auto-retry once if failed
+        if (result.status === 'error' || result.status === 'failed') {
+          send({ id: lid, msg: `🔁 Auto-retry (attempt 2)...`, type: 'warn' });
+          await new Promise(r => setTimeout(r, 2000)); // 2s wait before retry
+          result = await processOneLinkWithRetry(linkData, lid, 2);
         }
 
-        // Stream result to browser
+        // Stream final result
         send({
           id:               lid,
-          status:           resultPayload.status,
-          final:            resultPayload.finalLink,
-          best_button_name: resultPayload.best_button_name,
+          status:           result.status,
+          final:            result.finalLink,
+          best_button_name: result.best_button_name,
         });
 
         // Save to Firestore
         try {
-          await saveToFirestore(taskId, lid, linkData, resultPayload, extractedBy);
+          await saveToFirestore(taskId, lid, linkData, result, extractedBy);
         } catch { /* non-fatal */ }
 
         // Cache successful result
-        if (resultPayload.status === 'done' && resultPayload.finalLink) {
+        if (result.status === 'done' && result.finalLink) {
           try {
-            await setCachedLink(originalUrl, resultPayload.finalLink, 'stream_solve', {
-              best_button_name: resultPayload.best_button_name,
-              all_available_buttons: resultPayload.all_available_buttons,
+            await setCachedLink(linkData.link, result.finalLink, 'stream_solve', {
+              best_button_name: result.best_button_name,
+              all_available_buttons: result.all_available_buttons,
             });
           } catch { /* non-critical */ }
         }
 
-        // Finished marker for this link
         send({ id: lid, status: 'finished' });
+        linksDone++;
       };
 
-      // ─── Smart routing: Timer vs HubCloud-VPS vs Direct ──────────────────
-      //
-      // HUBCLOUD FIX: HubCloud VPS (port 5001) can only handle 1 request at a time.
-      // Previously hubcloud/hubdrive links were treated as "direct" (concurrent),
-      // causing all 4+ links to hit the VPS simultaneously → all failed.
-      // Now hubcloud + hubdrive links are sequential, just like timer links.
-      //
-      // Routing:
-      //   timerLinks      → gadgetsweb etc  → sequential (VPS port 10000, 1 at a time)
-      //   hubcloudLinks   → hubcloud/hubdrive/hubcdn → sequential (VPS port 5001, 1 at a time)
-      //   directLinks     → everything else → concurrent (fast, no VPS)
+      // ═══════════════════════════════════════════════════════════════════
+      // MAIN EXECUTION: ALL LINKS → STRICTLY ONE BY ONE (sequential)
+      // No parallel processing at all — VPS can't handle concurrent calls.
+      // Ek link complete → next link start.
+      // ═══════════════════════════════════════════════════════════════════
+      const total = linksToProcess.length;
 
-      const HUBCLOUD_DOMAINS = ['hubcloud', 'hubdrive', 'hubcdn'];
+      for (let i = 0; i < total; i++) {
+        const link = linksToProcess[i];
 
-      const timerLinks     = linksToProcess.filter((l: any) => TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
-      const hubcloudLinks  = linksToProcess.filter((l: any) =>
-        !TIMER_DOMAINS.some(d => (l.link || '').includes(d)) &&
-        HUBCLOUD_DOMAINS.some(d => (l.link || '').includes(d))
-      );
-      const directLinks    = linksToProcess.filter((l: any) =>
-        !TIMER_DOMAINS.some(d => (l.link || '').includes(d)) &&
-        !HUBCLOUD_DOMAINS.some(d => (l.link || '').includes(d))
-      );
-
-      // Direct links → CONCURRENT (fast, no VPS needed)
-      const directPromises = directLinks.map((l: any) => processLink(l, l.id));
-
-      // Timer links → STRICTLY SEQUENTIAL (VPS port 10000 handles 1 at a time)
-      const timerPromise = (async () => {
-        for (let i = 0; i < timerLinks.length; i++) {
-          const l = timerLinks[i];
-          if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) {
-            send({ id: l.id, msg: '⏳ Time budget exceeded — will retry in background', type: 'warn' });
-            send({ id: l.id, status: 'finished' });
-            continue;
-          }
-          send({ id: l.id, msg: `⏱ Timer link ${i + 1}/${timerLinks.length} — starting...`, type: 'info' });
-          await processLink(l, l.id);
+        // Time budget check
+        if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) {
+          send({ id: link.id, msg: '⏳ Time budget exceeded — will retry in background', type: 'warn' });
+          send({ id: link.id, status: 'finished' });
+          continue;
         }
-      })();
 
-      // HubCloud links → STRICTLY SEQUENTIAL (VPS port 5001 handles 1 at a time)
-      // THIS WAS THE BUG: these were running concurrent before → all failed on VPS
-      const hubcloudPromise = (async () => {
-        for (let i = 0; i < hubcloudLinks.length; i++) {
-          const l = hubcloudLinks[i];
-          if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) {
-            send({ id: l.id, msg: '⏳ Time budget exceeded — will retry in background', type: 'warn' });
-            send({ id: l.id, status: 'finished' });
-            continue;
-          }
-          send({ id: l.id, msg: `☁️ HubCloud link ${i + 1}/${hubcloudLinks.length} — starting...`, type: 'info' });
-          await processLink(l, l.id);
-        }
-      })();
-
-      // Run all three tracks simultaneously (each track is internally sequential)
-      await Promise.allSettled([...directPromises, timerPromise, hubcloudPromise]);
+        await processLink(link, link.id, i + 1, total);
+      }
 
       controller.close();
     },
