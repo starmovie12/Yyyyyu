@@ -807,26 +807,55 @@ export async function solveHubDrive(url: string): Promise<HubDriveResult> {
 // =============================================================================
 
 export async function solveHubCloudNative(url: string): Promise<HubCloudNativeResult> {
-  console.log(`[HubCloud] Starting VPS solver: ${url}`);
+  console.log(`[HubCloud] Calling VPS: ${HUBCLOUD_API_URL}/solve?url=${encodeURIComponent(url)}`);
   try {
     const resp = await axios.get(`${HUBCLOUD_API_URL}/solve?url=${encodeURIComponent(url)}`, {
-      timeout: AXIOS_TIMEOUT_MS, // 45s — was 20s (caused premature kills)
+      timeout: AXIOS_TIMEOUT_MS,
       headers: { 'User-Agent': 'MflixPro/1.0' },
     });
 
     const data = resp.data;
-    if (data.status === 'success' && data.best_download_link) {
+    console.log(`[HubCloud] VPS raw response:`, JSON.stringify(data));
+
+    // VPS returns: {"link":"https://...","status":"success"}
+    const downloadLink =
+      data.link               ||   // ← VPS actual field name
+      data.best_download_link ||
+      data.download_link      ||
+      data.final_link         ||
+      data.url                ||
+      data.result             ||
+      null;
+
+    const buttonName =
+      data.best_button_name ||
+      data.button_name      ||
+      data.name             ||
+      null;
+
+    const allButtons =
+      data.all_available_buttons ||
+      data.buttons               ||
+      data.available_buttons     ||
+      [];
+
+    if (downloadLink) {
+      console.log(`[HubCloud] ✅ Success: ${downloadLink}`);
       return {
         status:                'success',
-        best_button_name:      data.best_button_name      || undefined,
-        best_download_link:    data.best_download_link,
-        all_available_buttons: data.all_available_buttons || [],
+        best_button_name:      buttonName   || undefined,
+        best_download_link:    downloadLink,
+        all_available_buttons: allButtons,
       };
     }
 
-    return { status: 'error', message: data.message || 'VPS API returned no download link' };
+    const errMsg = data.message || data.error || `No link in response: ${JSON.stringify(data)}`;
+    console.log(`[HubCloud] ❌ ${errMsg}`);
+    return { status: 'error', message: errMsg };
+
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
+    console.log(`[HubCloud] ❌ Exception: ${msg}`);
     return { status: 'error', message: `VPS API error: ${msg}` };
   }
 }
