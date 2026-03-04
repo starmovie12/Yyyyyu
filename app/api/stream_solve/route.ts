@@ -339,36 +339,64 @@ export async function POST(req: Request) {
         send({ id: lid, status: 'finished' });
       };
 
-      // ─── Smart routing: Timer vs Direct ─────────────────────────────────
-      const timerLinks  = linksToProcess.filter((l: any) => TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
-      const directLinks = linksToProcess.filter((l: any) => !TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
+      // ─── Smart routing: Timer vs HubCloud-VPS vs Direct ──────────────────
+      //
+      // HUBCLOUD FIX: HubCloud VPS (port 5001) can only handle 1 request at a time.
+      // Previously hubcloud/hubdrive links were treated as "direct" (concurrent),
+      // causing all 4+ links to hit the VPS simultaneously → all failed.
+      // Now hubcloud + hubdrive links are sequential, just like timer links.
+      //
+      // Routing:
+      //   timerLinks      → gadgetsweb etc  → sequential (VPS port 10000, 1 at a time)
+      //   hubcloudLinks   → hubcloud/hubdrive/hubcdn → sequential (VPS port 5001, 1 at a time)
+      //   directLinks     → everything else → concurrent (fast, no VPS)
 
-      // PROBLEM 1 FIX: Direct links → CONCURRENT (parallel, fast)
+      const HUBCLOUD_DOMAINS = ['hubcloud', 'hubdrive', 'hubcdn'];
+
+      const timerLinks     = linksToProcess.filter((l: any) => TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
+      const hubcloudLinks  = linksToProcess.filter((l: any) =>
+        !TIMER_DOMAINS.some(d => (l.link || '').includes(d)) &&
+        HUBCLOUD_DOMAINS.some(d => (l.link || '').includes(d))
+      );
+      const directLinks    = linksToProcess.filter((l: any) =>
+        !TIMER_DOMAINS.some(d => (l.link || '').includes(d)) &&
+        !HUBCLOUD_DOMAINS.some(d => (l.link || '').includes(d))
+      );
+
+      // Direct links → CONCURRENT (fast, no VPS needed)
       const directPromises = directLinks.map((l: any) => processLink(l, l.id));
 
-      // PROBLEM 1 FIX: Timer links → STRICTLY SEQUENTIAL (one by one)
-      // VPS Timer API can only handle 1 request at a time.
-      // If we send 2+ simultaneously, one will succeed and others crash.
+      // Timer links → STRICTLY SEQUENTIAL (VPS port 10000 handles 1 at a time)
       const timerPromise = (async () => {
         for (let i = 0; i < timerLinks.length; i++) {
           const l = timerLinks[i];
-
-          // Time budget check — don't start a new timer link if we might not finish
           if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) {
             send({ id: l.id, msg: '⏳ Time budget exceeded — will retry in background', type: 'warn' });
             send({ id: l.id, status: 'finished' });
             continue;
           }
-
-          // Process this ONE timer link — VPS gets full attention
           send({ id: l.id, msg: `⏱ Timer link ${i + 1}/${timerLinks.length} — starting...`, type: 'info' });
           await processLink(l, l.id);
         }
       })();
 
-      // Run direct (parallel) + timer (sequential) simultaneously
-      // Timer won't interfere with direct because they use different VPS ports
-      await Promise.allSettled([...directPromises, timerPromise]);
+      // HubCloud links → STRICTLY SEQUENTIAL (VPS port 5001 handles 1 at a time)
+      // THIS WAS THE BUG: these were running concurrent before → all failed on VPS
+      const hubcloudPromise = (async () => {
+        for (let i = 0; i < hubcloudLinks.length; i++) {
+          const l = hubcloudLinks[i];
+          if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) {
+            send({ id: l.id, msg: '⏳ Time budget exceeded — will retry in background', type: 'warn' });
+            send({ id: l.id, status: 'finished' });
+            continue;
+          }
+          send({ id: l.id, msg: `☁️ HubCloud link ${i + 1}/${hubcloudLinks.length} — starting...`, type: 'info' });
+          await processLink(l, l.id);
+        }
+      })();
+
+      // Run all three tracks simultaneously (each track is internally sequential)
+      await Promise.allSettled([...directPromises, timerPromise, hubcloudPromise]);
 
       controller.close();
     },
