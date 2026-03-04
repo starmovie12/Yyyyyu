@@ -291,20 +291,27 @@ export async function POST(req: Request) {
 
             // HubCloud / HubCDN
             if (currentLink.includes('hubcloud') || currentLink.includes('hubcdn')) {
-              log('☁️ HubCloud solving via VPS... (queued)');
-              const r = await solveHubCloudSequential(currentLink);
-              if (r.status === 'success' && r.best_download_link) {
-                log(`✅ Done: ${r.best_download_link}`, 'success');
-                return {
-                  finalLink:             r.best_download_link,
-                  status:                'done',
-                  best_button_name:      r.best_button_name      ?? null,
-                  all_available_buttons: r.all_available_buttons ?? [],
-                  logs,
-                };
+              log(`☁️ HubCloud VPS call: ${currentLink}`);
+              try {
+                const r = await solveHubCloudSequential(currentLink);
+                if (r.status === 'success' && r.best_download_link) {
+                  log(`✅ HubCloud done: ${r.best_download_link}`, 'success');
+                  return {
+                    finalLink:             r.best_download_link,
+                    status:                'done',
+                    best_button_name:      r.best_button_name      ?? null,
+                    all_available_buttons: r.all_available_buttons ?? [],
+                    logs,
+                  };
+                }
+                const errDetail = r.message || 'No download link in response';
+                log(`❌ HubCloud failed: ${errDetail}`, 'error');
+                return { status: 'error', error: errDetail, logs };
+              } catch (hubErr: any) {
+                const errMsg = hubErr?.message || String(hubErr);
+                log(`❌ HubCloud exception: ${errMsg}`, 'error');
+                return { status: 'error', error: errMsg, logs };
               }
-              log(`❌ HubCloud VPS failed: ${r.message}`, 'error');
-              return { status: 'error', error: r.message, logs };
             }
 
             // GDflix / DriveHub
