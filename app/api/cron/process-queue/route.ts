@@ -174,93 +174,67 @@ async function getActiveTask(): Promise<{ taskId: string; links: any[] } | null>
   }
 }
 
+// 🔴 THE FIX: SERVER RAM LIMIT & TIMEOUT BYPASS
 async function processPendingLinks(
   taskId: string,
   links: any[],
   req: NextRequest,
 ): Promise<{ triggeredRelay: boolean; stillPending: number; doneLinks: number; totalLinks: number }> {
+  
   const pendingLinks = links.filter(
     (l: any) => !TERMINAL.includes((l.status || '').toLowerCase())
   );
 
-  const timerLinks  = pendingLinks.filter((l: any) => TIMER_DOMAINS.some(d => l.link?.includes(d)));
-  const directLinks = pendingLinks.filter((l: any) => !TIMER_DOMAINS.some(d => l.link?.includes(d)));
-
-  console.log(`[Cron] Task ${taskId}: ${directLinks.length} direct + ${timerLinks.length} timer pending`);
-
-  const directPromises = directLinks.map((l: any) =>
-    processLink(l, l.id, taskId, 'Server/Auto-Pilot')
-  );
+  console.log(`[Cron] Task ${taskId}: ${pendingLinks.length} total pending links. Picking ONLY 1 to save RAM.`);
 
   let triggeredRelay = false;
-  const timerPromise = (async () => {
-    if (timerLinks.length > 0) {
-      await processLink(timerLinks[0], timerLinks[0].id, taskId, 'Server/Auto-Pilot');
 
-      if (timerLinks.length > 1) {
-        triggeredRelay = true;
-        const targetUrl = process.env.VERCEL_URL
-          ? `https://${process.env.VERCEL_URL}/api/solve_task`
-          : `${req.nextUrl.origin}/api/solve_task`;
+  // RULE: Pick ONLY the FIRST pending link (No concurrent direct links, no server crash)
+  if (pendingLinks.length > 0) {
+    const targetLink = pendingLinks[0];
+    const isTimerDomain = TIMER_DOMAINS.some(d => targetLink.link?.includes(d));
 
-        try {
-          fetch(targetUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-mflix-internal': 'true',
-            },
-            body: JSON.stringify({
-              taskId,
-              timerLinks,
-              timerIndex:  1,
-              extractedBy: 'Server/Auto-Pilot',
-              relayDepth:  1,
-              mode:        'relay',
-            }),
-            keepalive: true,
-          }).catch(e => console.error('[Relay] error:', e));
-        } catch { /* non-critical */ }
-      }
-    }
-  })();
-
-  await Promise.allSettled([...directPromises, timerPromise]);
-
-  const freshSnap  = await db.collection('scraping_tasks').doc(taskId).get();
-  const freshLinks: any[] = freshSnap.data()?.links || [];
-  const stillPending = freshLinks.filter(
-    (l: any) => !TERMINAL.includes((l.status || '').toLowerCase())
-  ).length;
-  const doneLinks = freshLinks.filter(
-    (l: any) => ['done', 'success'].includes((l.status || '').toLowerCase())
-  ).length;
-
-  if (stillPending === 0 && !triggeredRelay) {
-    const allSuccess = freshLinks.every(
-      (l: any) => ['done', 'success'].includes((l.status || '').toLowerCase())
-    );
-    await db.collection('scraping_tasks').doc(taskId).update({
-      status: allSuccess ? 'completed' : 'failed',
-      completedAt: new Date().toISOString(),
+    // 'Fire and Forget' pattern: Start processing but DO NOT 'await' it to stop Vercel Timeout
+    processLink(targetLink, targetLink.id, taskId, 'Server/Auto-Pilot').catch(e => {
+        console.error(`[Process Error on link ${targetLink.id}]`, e);
     });
 
-    for (const col of queueCollections) {
-      const qSnap = await db.collection(col)
-        .where('taskId', '==', taskId)
-        .where('status', '==', 'processing')
-        .limit(1)
-        .get();
-      if (!qSnap.empty) {
-        await qSnap.docs[0].ref.update({
-          status: 'completed',
-          processedAt: new Date().toISOString(),
-        });
-      }
+    // If there are more links remaining, trigger Relay for the next one immediately
+    if (pendingLinks.length > 1) {
+      triggeredRelay = true;
+      const targetUrl = process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL}/api/solve_task`
+        : `${req.nextUrl.origin}/api/solve_task`;
+
+      try {
+        // Calling Relay API but NOT awaiting it.
+        fetch(targetUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-mflix-internal': 'true',
+          },
+          body: JSON.stringify({
+            taskId,
+            // Pass ONLY the next link in the queue to Relay
+            timerLinks: [pendingLinks[1]], 
+            timerIndex: 0,
+            extractedBy: 'Server/Auto-Pilot',
+            relayDepth: 1,
+            mode: 'relay',
+          }),
+          keepalive: true,
+        }).catch(e => console.error('[Relay] error:', e));
+      } catch { /* non-critical */ }
     }
   }
 
-  return { triggeredRelay, stillPending, doneLinks, totalLinks: freshLinks.length };
+  // Note: We are no longer waiting for fresh data from DB here because we "Fired and Forgot".
+  // This ensures the Vercel function returns in < 1 second.
+  const stillPending = pendingLinks.length > 0 ? pendingLinks.length - 1 : 0;
+  const doneLinks = links.length - pendingLinks.length;
+
+  return { triggeredRelay, stillPending, doneLinks, totalLinks: links.length };
 }
 
 export async function GET(req: NextRequest) {
