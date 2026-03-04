@@ -945,9 +945,6 @@ export default function MflixApp() {
         addAutoPilotLog(`✅ Task created: ${taskId}`, 'success');
 
         // ── Step 2: Links fetch karo ──────────────────────────────────────
-        // Firebase ko task write karne ka waqt dena — 2s wait
-        await sleep(2000);
-
         const tasksRes = await fetch('/api/tasks');
         if (!tasksRes.ok) {
           throw new Error('Failed to fetch tasks after creation');
@@ -1084,10 +1081,8 @@ export default function MflixApp() {
           }
         }
 
-        // ── Stream ended — all links processed within this request ────────
+        // ── Stream ended — all links processed ────────────────────────
         setActiveTaskId(null);
-        fetchTasks();
-        await sleep(2000);
         fetchTasks();
 
         addAutoPilotLog(`🎉 Done: ${item.title || item.url}`, 'success');
@@ -1188,10 +1183,9 @@ export default function MflixApp() {
         };
       });
 
-      // Last item ke baad cooldown nahi chahiye
+      // Last item ke baad koi cooldown nahi
       if (processed < stats.pendingItems.length) {
-        addAutoPilotLog('⏳ Cooling down 3 seconds...', 'info');
-        await sleep(3000);
+        // No delay — process next movie immediately
       }
     }
 
@@ -2270,17 +2264,26 @@ export default function MflixApp() {
                         className="overflow-hidden"
                       >
                         <div className="mt-2 space-y-1 max-h-[200px] overflow-y-auto pr-1">
-                          {queueStats.pendingItems.map((item, idx) => (
+                          {queueStats.pendingItems.map((item, idx) => {
+                            const isActive = currentQueueItem?.id === item.id;
+                            return (
                             <div
                               key={item.id}
-                              className="flex items-center gap-2 text-[11px] font-mono text-slate-500 bg-black/30 rounded-lg px-2.5 py-1.5"
+                              className={`flex items-center gap-2 text-[11px] font-mono rounded-lg px-2.5 py-1.5 transition-all ${
+                                isActive
+                                  ? 'bg-violet-500/20 border border-violet-500/40 text-white'
+                                  : 'bg-black/30 text-slate-500'
+                              }`}
                             >
-                              <span className="text-slate-700 w-4 flex-shrink-0">
-                                {idx + 1}.
+                              <span className={`w-4 flex-shrink-0 ${isActive ? 'text-violet-400 font-bold' : 'text-slate-700'}`}>
+                                {isActive ? '▶' : `${idx + 1}.`}
                               </span>
-                              <span className="truncate flex-1 text-slate-400">
+                              <span className={`truncate flex-1 ${isActive ? 'text-violet-200 font-semibold' : 'text-slate-400'}`}>
                                 {item.title || item.url}
                               </span>
+                              {isActive && (
+                                <span className="flex-shrink-0 w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />
+                              )}
                               <span
                                 className={`flex-shrink-0 px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase ${
                                   item.type === 'movie'
@@ -2291,7 +2294,8 @@ export default function MflixApp() {
                                 {item.type === 'movie' ? 'M' : 'S'}
                               </span>
                             </div>
-                          ))}
+                            );
+                          })}
                         </div>
                       </motion.div>
                     )}
